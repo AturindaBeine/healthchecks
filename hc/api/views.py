@@ -518,10 +518,7 @@ def channels(request: ApiRequest) -> JsonResponse:
 def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
-        # [IMPROVEMENT 15] Log cross-project access attempts.
-        # ORIGINAL: returned 403 with no log.
-        # FIX: A project accessing another project's check may indicate a
-        # misconfigured or malicious client. This should be logged as a warning.
+        # log attempts of a project accessing another project's check.
         logger.warning(
             "get_check forbidden: check=%s belongs to project=%s but request is from project=%s",
             code,
@@ -576,9 +573,7 @@ def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
             )
             return JsonResponse({"error": e.message}, status=400)
 
-    # [IMPROVEMENT 16] Log successful updates.
-    # ORIGINAL: No logging on successful updates.
-    # FIX: Logging updates provides an audit trail of configuration changes.
+    # log successful updates to provide an audit trail of configuration changes
     logger.info(
         "Check updated: code=%s project=%s", check.code, request.project.code
     )
@@ -601,10 +596,7 @@ def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
         check = get_object_or_404(Check.objects.select_for_update(), code=code)
         check.delete()
 
-    # [IMPROVEMENT 17] Log check deletion — a destructive, irreversible action.
-    # ORIGINAL: No logging on deletion.
-    # FIX: Deletions are high-value audit events. If a check disappears, the
-    # log tells you when and from which project it was deleted.
+    # log the deletion of a check since it is a destructive action that cannot be reversed.
     logger.info(
         "Check deleted: code=%s name=%r project=%s", code, check.name, request.project.code
     )
@@ -640,10 +632,7 @@ def pause(request: ApiRequest, code: UUID) -> HttpResponse:
     check.save()
     check.project.update_next_nag_dates()
 
-    # [IMPROVEMENT 18] Log pause action.
-    # ORIGINAL: No logging on pause.
-    # FIX: Pausing a check silences alerts. Logging this is important for
-    # post-incident reviews ("why did we not get alerted?").
+    # log the pausing of a check since it silences alerts. 
     logger.info("Check paused: code=%s project=%s", check.code, request.project.code)
 
     return JsonResponse(check.to_dict(v=request.v))
@@ -658,10 +647,7 @@ def resume(request: ApiRequest, code: UUID) -> HttpResponse:
         return HttpResponseForbidden()
 
     if check.status != "paused":
-        # [IMPROVEMENT 19] Log invalid resume attempts.
-        # ORIGINAL: returned 409 with no log.
-        # FIX: Attempting to resume a non-paused check may indicate a race
-        # condition or client bug. Logging it helps diagnose integration issues.
+        # log invalid attempts to resume a non-paused check
         logger.warning(
             "resume rejected: check=%s is not paused (status=%s)",
             check.code,
