@@ -700,11 +700,7 @@ def ping_body(request: ApiRequest, code: UUID, n: int) -> HttpResponse:
     try:
         body = ping.get_body_bytes()
     except Ping.GetBodyError:
-        # [IMPROVEMENT 20] Log object storage retrieval errors at ERROR level.
-        # ORIGINAL: returned 503 with no log.
-        # FIX: A GetBodyError means external object storage (S3/MinIO) is
-        # unavailable or the object is missing. This is an infrastructure problem
-        # that needs immediate operator attention. ERROR-level ensures alerting.
+        # log object storage retrieval errors at ERROR level.
         logger.error(
             "ping_body: failed to retrieve body from object storage "
             "for check=%s ping_n=%d",
@@ -726,10 +722,7 @@ def flips(request: ApiRequest, check: Check) -> HttpResponse:
 
     form = FlipsFiltersForm(request.GET)
     if not form.is_valid():
-        # [IMPROVEMENT 21] Log invalid flip filter parameters.
-        # ORIGINAL: returned 400 with no log.
-        # FIX: Bad flip filter parameters indicate a client integration bug.
-        # Logging the errors helps API consumers understand what they got wrong.
+        # log invalid flip filter parameters to help API consumers understand what they got wrong
         logger.warning(
             "flips: invalid filter params for check=%s errors=%r",
             check.code,
@@ -818,11 +811,7 @@ def badge(
         with_late = False
 
     if not check_signature(badge_key, tag, signature):
-        # [IMPROVEMENT 22] Log invalid badge signature attempts.
-        # ORIGINAL: returned 404 with no log.
-        # FIX: An invalid signature may indicate a tampered or expired URL.
-        # Logging at DEBUG level (not WARNING, since this may be common for
-        # expired URLs) helps diagnose badge rendering issues.
+        # log invalid badge signature attempts.
         logger.debug(
             "badge: invalid signature for badge_key=%s tag=%r", badge_key, tag
         )
@@ -905,11 +894,7 @@ def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
         cutoff = now() - td(hours=1)
         notification = Notification.objects.get(code=code, created__gt=cutoff)
     except Notification.DoesNotExist:
-        # [IMPROVEMENT 23] Log expired/missing notification callbacks at DEBUG.
-        # ORIGINAL: returned HTTP 200 silently.
-        # FIX: Expired callbacks from delivery providers (Twilio, etc.) are
-        # normal but worth logging at DEBUG so operators can verify retry storms
-        # are not happening.
+        # log expired/missing notification callbacks at DEBUG.
         logger.debug(
             "notification_status: notification %s not found or older than 1 hour", code
         )
@@ -937,11 +922,7 @@ def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
         if mark_disabled:
             channel_q.update(disabled=True)
 
-        # [IMPROVEMENT 24] Log notification delivery failures.
-        # ORIGINAL: No logging of delivery failures.
-        # FIX: A delivery failure means a user did NOT receive an alert. This is
-        # a critical event — logging it at WARNING ensures operators and monitoring
-        # tools can detect patterns of failed notification channels.
+        # log notification delivery failures.
         logger.warning(
             "Notification delivery failed: notification=%s error=%r mark_disabled=%s",
             code,
@@ -958,10 +939,7 @@ def metrics(request: HttpRequest) -> HttpResponse:
 
     key = request.headers.get("X-Metrics-Key")
     if key != settings.METRICS_KEY:
-        # [IMPROVEMENT 25] Log invalid metrics key usage.
-        # ORIGINAL: returned 403 with no log.
-        # FIX: The metrics endpoint is sensitive. An invalid key may indicate a
-        # misconfigured scraper or a brute-force attempt.
+        # log invalid use of metrics key 
         logger.warning("metrics: invalid X-Metrics-Key from %s", request.META.get("REMOTE_ADDR"))
         return HttpResponseForbidden()
 
@@ -990,11 +968,7 @@ def bounces(request: HttpRequest) -> HttpResponse:
     try:
         unsigned = unsign_bounce_id(to_local, max_age=3600 * 48)
     except BadSignature:
-        # [IMPROVEMENT 26] Log bad bounce signatures at DEBUG level.
-        # ORIGINAL: returned HTTP 200 silently.
-        # FIX: Bad signatures may occur for expired bounce addresses (normal)
-        # or for spoofed emails (abnormal). DEBUG-level logging lets operators
-        # investigate if needed without flooding WARNING logs.
+        # log bad signatures at DEBUG level that may occur for expired bounce addresses which is normal or for spoofed emails which is abnormal 
         logger.debug(
             "bounces: bad or expired bounce signature for to_local=%r", to_local
         )
@@ -1040,10 +1014,7 @@ def bounces(request: HttpRequest) -> HttpResponse:
         if permanent:
             channel_q.update(disabled=True)
 
-        # [IMPROVEMENT 27] Log email bounce events.
-        # ORIGINAL: No logging on bounce processing.
-        # FIX: An email bounce means a user's notification email is bouncing.
-        # Logging it at WARNING ensures it surfaces in monitoring dashboards.
+        # log email bounce events
         logger.warning(
             "Email bounce processed: notification=%s status=%r permanent=%s error=%r",
             notification_code,
@@ -1067,10 +1038,7 @@ def bounces(request: HttpRequest) -> HttpResponse:
         profile.next_nag_date = None
         profile.save()
 
-        # [IMPROVEMENT 28] Log when a user's reports are disabled due to a bounce.
-        # ORIGINAL: No logging when a user's reports get turned off.
-        # FIX: This is a significant side-effect — the user will stop receiving
-        # monthly reports. Logging it at INFO ensures it is traceable.
+        # log when a user's reports are disabled due to a bounce.
         logger.info(
             "Reports disabled due to permanent email bounce: username=%r", username
         )
