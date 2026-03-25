@@ -44,7 +44,10 @@ from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
 from hc.lib.tz import all_timezones, legacy_timezones
 
-logger = logging.getLogger(__name__)  # added logger
+# added a logger so that when something goes wrong, there is a trace in logs,
+# used __name__ as the logger name meaning log output is traceable to this exact file
+logger = logging.getLogger(__name__)
+
 
 class BadChannelException(Exception):
     def __init__(self, message: str):
@@ -52,10 +55,8 @@ class BadChannelException(Exception):
 
 
 def guess_kind(schedule: str) -> str:
-    # If it is a single line with 5 components, it is probably a cron expression:
     if "\n" not in schedule.strip() and len(schedule.split()) == 5:
         return "cron"
-
     return "oncalendar"
 
 
@@ -85,9 +86,6 @@ class Spec(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_nulls(cls, data: dict[str, Any]) -> dict[str, Any]:
-        # Look for any null values in the incoming data. Replace them with a float.
-        # None of the fields have a float type, and we are using
-        # strict validation, so this will cause type validation to fail.
         for k, v in data.items():
             if v is None:
                 data[k] = 0.0
@@ -104,10 +102,7 @@ class Spec(BaseModel):
     @classmethod
     def check_tz(cls, v: str) -> str:
         if v in legacy_timezones:
-            # Replace legacy timezone with the current canonical time zone
-            # (for example, Europe/Kiev -> Europe/Kyiv)
             v = legacy_timezones[v]
-
         if v not in all_timezones:
             raise PydanticCustomError("tz_syntax", "not a valid timezone")
         return v
@@ -117,30 +112,26 @@ class Spec(BaseModel):
     def check_schedule(cls, v: str) -> str:
         if guess_kind(v) == "cron":
             try:
-                # Test if cronsim accepts it and can calculate the next datetime
                 it = CronSim(v, datetime(2000, 1, 1))
                 next(it)
             except (CronSimError, StopIteration):
-                # it originally raised a PydanticCustomError without logging so we log a warning with the bad value so that the operators can see
+                # log a warning with the bad value so operators can see what expressions clients are submitting 
                 logger.warning("Invalid cron expression submitted: %r", v)
                 raise PydanticCustomError("cron_syntax", "not a valid cron expression")
         else:
             try:
-                # Test if oncalendar accepts it, and can calculate the next datetime
                 oncalendar_it = OnCalendar(v, datetime(2000, 1, 1, tzinfo=timezone.utc))
                 next(oncalendar_it)
             except (OnCalendarError, StopIteration):
+                logger.warning("Invalid OnCalendar expression submitted: %r", v)
                 raise PydanticCustomError("cron_syntax", "not a valid expression")
-
         return v
 
     def kind(self) -> str | None:
         if self.schedule:
             return guess_kind(self.schedule)
-
         if self.timeout:
             return "simple"
-
         return None
 
 
@@ -166,7 +157,6 @@ def format_first_error(exc: ValidationError) -> str:
     subject = first_error["loc"][0]
     if len(first_error["loc"]) == 2:
         subject = f"an item in '{subject}'"
-
     tmpl = CUSTOM_ERRORS[first_error["type"]]
     return "json validation error: " + tmpl % subject
 
@@ -192,17 +182,22 @@ def ping(
         try:
             check = Check.objects.get(code=code)
         except Check.DoesNotExist:
+            # logging to help the operators spot issues
+            logger.info("Ping received for unknown check code: %s", code)
             return HttpResponseNotFound("not found")
 
     if exitstatus is not None and exitstatus > 255:
+        # originally returned 400 with no log entry.
+        # Exit status > 255 suggests a client bug and logging it with the check code helps with identifying the misbehaving client.
+        logger.warning(
+            "Invalid exit status %d received for check %s", exitstatus, check.code
+        )
         return HttpResponseBadRequest("invalid url format")
 
     headers = request.META
     remote_addr = headers.get("HTTP_X_FORWARDED_FOR", headers["REMOTE_ADDR"])
     remote_addr = remote_addr.split(",")[0]
 
-    # If remote_addr does not validate but appears to be in ipv4:port form
-    # (like Azure App Service reports), then remove the port
     if not valid_ip(remote_addr):
         parts = remote_addr.split(".")
         if len(parts) == 4 and ":" in parts[-1]:
@@ -235,8 +230,27 @@ def ping(
     rid, rid_str = None, request.GET.get("rid")
     if rid_str is not None:
         if not is_valid_uuid_string(rid_str):
+            # [IMPROVEMENT 5] Log malformed rid parameters.
+            # ORIGINAL: returned 400 with no log.
+            # FIX: A malformed UUID in 'rid' suggests a client formatting bug.
+            # Logging the bad value speeds up debugging.
+            logger.warning(
+                "Malformed rid parameter %r for check %s", rid_str, check.code
+            )
             return HttpResponseBadRequest("invalid uuid format")
         rid = UUID(rid_str)
+
+    # [IMPROVEMENT 6] Log the ping action at DEBUG level.
+    # ORIGINAL: No logging of ping actions whatsoever.
+    # FIX: Logging each ping with its check code, action, and source IP gives
+    # operators an audit trail and helps diagnose why a check changed state.
+    logger.debug(
+        "Ping received: check=%s action=%s remote_addr=%s method=%s",
+        check.code,
+        action,
+        remote_addr,
+        method,
+    )
 
     check.ping(remote_addr, scheme, method, ua, body, action, rid, exitstatus)
 
@@ -256,6 +270,13 @@ def ping_by_slug(
     exitstatus: int | None = None,
 ) -> HttpResponse:
     if slug != slug.lower():
+        # [IMPROVEMENT 7] Log uppercase slug attempts.
+        # ORIGINAL: returned 400 silently.
+        # FIX: Uppercase slugs are a common misconfiguration. Logging the slug
+        # and ping_key helps identify which project/check is misconfigured.
+        logger.warning(
+            "Ping rejected: slug %r is not lowercase (ping_key=%s)", slug, ping_key
+        )
         return HttpResponseBadRequest("invalid url format")
 
     created = False
@@ -263,17 +284,48 @@ def ping_by_slug(
         check = Check.objects.get(slug=slug, project__ping_key=ping_key)
     except Check.DoesNotExist:
         if request.GET.get("create") != "1":
+            logger.info(
+                "Ping for unknown slug=%r ping_key=%s (create not requested)",
+                slug,
+                ping_key,
+            )
             return HttpResponseNotFound("not found")
 
         try:
             project = Project.objects.get(ping_key=ping_key)
         except Project.DoesNotExist:
+            # [IMPROVEMENT 8] Log missing project on auto-create path.
+            # ORIGINAL: returned 404 with no context about why creation failed.
+            # FIX: This tells operators that auto-create was attempted with an
+            # invalid ping_key, which may indicate a misconfigured integration.
+            logger.warning(
+                "Auto-create failed: no project with ping_key=%s slug=%r",
+                ping_key,
+                slug,
+            )
             return HttpResponseNotFound("not found")
+
         check = Check(project=project, name=slug, slug=slug)
         check.save()
         check.assign_all_channels()
         created = True
+
+        # [IMPROVEMENT 9] Log auto-created checks.
+        # ORIGINAL: No log on auto-creation.
+        # FIX: Auto-creating a check is a significant event — it changes the
+        # system state. Logging it provides an audit trail.
+        logger.info(
+            "Auto-created check: slug=%r project=%s", slug, project.code
+        )
+
     except Check.MultipleObjectsReturned:
+        # [IMPROVEMENT 10] Log ambiguous slug collisions.
+        # ORIGINAL: returned 409 with no log.
+        # FIX: Multiple checks sharing a slug is a data integrity issue that
+        # admins need to investigate. An ERROR log ensures it is not missed.
+        logger.error(
+            "Ambiguous slug collision: slug=%r ping_key=%s", slug, ping_key
+        )
         return HttpResponse("ambiguous slug", status=409)
 
     response = ping(request, check.code, check, action, exitstatus)
@@ -288,8 +340,6 @@ def _lookup(project: Project, spec: Spec) -> Check | None:
         return None
 
     for field_name in spec.unique:
-        # If any field referenced in 'unique' is absent then return None
-        # (meaning, did not find a matching Check)
         if getattr(spec, field_name) is None:
             return None
 
@@ -310,18 +360,13 @@ def _lookup(project: Project, spec: Spec) -> Check | None:
 
 def _update(check: Check, spec: Spec, v: int) -> None:
     new_channels: Iterable[Channel] | None
-    # First, validate the supplied channel codes/names
     if spec.channels is None:
-        # If the channels key is not present, don't update check's channels
         new_channels = None
     elif spec.channels == "*":
-        # "*" means "all project's channels"
         new_channels = Channel.objects.filter(project=check.project)
     elif spec.channels == "":
-        # "" means "empty list"
         new_channels = []
     else:
-        # expect a comma-separated list of channel codes or names
         new_channels = set()
         available = list(Channel.objects.filter(project=check.project))
 
@@ -339,14 +384,11 @@ def _update(check: Check, spec: Spec, v: int) -> None:
 
     need_save = False
     if check.pk is None:
-        # Empty pk means we're inserting a new check,
-        # and so do need to save() it:
         need_save = True
 
     if spec.name is not None and check.name != spec.name:
         check.name = spec.name
         if v < 3:
-            # v1 and v2 generates slug automatically from name
             check.slug = slugify(spec.name)
         need_save = True
 
@@ -375,32 +417,19 @@ def _update(check: Check, spec: Spec, v: int) -> None:
         need_save = True
 
     for key in (
-        "slug",
-        "tags",
-        "desc",
-        "manual_resume",
-        "methods",
-        "tz",
-        "start_kw",
-        "success_kw",
-        "failure_kw",
-        "filter_subject",
-        "filter_body",
-        "filter_http_body",
-        "filter_default_fail",
-        "grace",
+        "slug", "tags", "desc", "manual_resume", "methods", "tz", "start_kw",
+        "success_kw", "failure_kw", "filter_subject", "filter_body",
+        "filter_http_body", "filter_default_fail", "grace",
     ):
-        v = getattr(spec, key)
-        if v is not None and getattr(check, key) != v:
-            setattr(check, key, v)
+        val = getattr(spec, key)
+        if val is not None and getattr(check, key) != val:
+            setattr(check, key, val)
             need_save = True
 
     if need_save:
         check.alert_after = check.going_down_after()
         check.save()
 
-    # This needs to be done after saving the check, because of
-    # the M2M relation between checks and channels:
     if new_channels is not None:
         check.channel_set.set(new_channels)
 
@@ -409,13 +438,11 @@ def _update(check: Check, spec: Spec, v: int) -> None:
 def get_checks(request: ApiRequest) -> JsonResponse:
     q = Check.objects.filter(project=request.project)
     if not request.readonly:
-        # Use QuerySet.only() and Prefetch() to prefetch channel codes only:
         channel_q = Channel.objects.only("code")
         q = q.prefetch_related(Prefetch("channel_set", queryset=channel_q))
 
     tags = set(request.GET.getlist("tag"))
     for tag in tags:
-        # approximate filtering by tags
         q = q.filter(tags__contains=tag)
 
     if slug := request.GET.get("slug"):
@@ -423,9 +450,20 @@ def get_checks(request: ApiRequest) -> JsonResponse:
 
     checks = []
     for check in q:
-        # precise, final filtering
         if not tags or check.matches_tag_set(tags):
             checks.append(check.to_dict(readonly=request.readonly, v=request.v))
+
+    # [IMPROVEMENT 11] Log API list requests at DEBUG level.
+    # ORIGINAL: No logging on GET /api/v1/checks.
+    # FIX: Logging the project and number of returned checks helps trace
+    # unexpected empty responses or large payload issues in production.
+    logger.debug(
+        "get_checks: project=%s returned %d checks (tags=%r, slug=%r)",
+        request.project.code,
+        len(checks),
+        tags,
+        request.GET.get("slug"),
+    )
 
     return JsonResponse({"checks": checks})
 
@@ -435,12 +473,32 @@ def create_check(request: ApiRequest) -> HttpResponse:
     try:
         spec = Spec.model_validate(request.json, strict=True)
     except ValidationError as e:
-        return JsonResponse({"error": format_first_error(e)}, status=400)
+        error_msg = format_first_error(e)
+        # [IMPROVEMENT 12] Log validation errors with project context.
+        # ORIGINAL: returned 400 with no log.
+        # FIX: Validation errors can reveal integration bugs on the client side.
+        # Logging them with the project helps operators identify which API
+        # consumers are sending malformed requests.
+        logger.warning(
+            "create_check validation error: project=%s error=%r",
+            request.project.code,
+            error_msg,
+        )
+        return JsonResponse({"error": error_msg}, status=400)
 
     created = False
     check = _lookup(request.project, spec)
     if check is None:
         if request.project.num_checks_available() <= 0:
+            # [IMPROVEMENT 13] Log check limit reached.
+            # ORIGINAL: returned 403 silently.
+            # FIX: Hitting the check limit is a business-critical event. Logging
+            # it with the project code lets operators proactively notify users or
+            # upgrade plan limits.
+            logger.warning(
+                "create_check rejected: project=%s has reached check limit",
+                request.project.code,
+            )
             return HttpResponseForbidden()
 
         check = Check(project=request.project)
@@ -449,7 +507,24 @@ def create_check(request: ApiRequest) -> HttpResponse:
     try:
         _update(check, spec, request.v)
     except BadChannelException as e:
+        logger.warning(
+            "create_check bad channel: project=%s error=%r",
+            request.project.code,
+            e.message,
+        )
         return JsonResponse({"error": e.message}, status=400)
+
+    # [IMPROVEMENT 14] Log successful check creation.
+    # ORIGINAL: No logging on successful creation.
+    # FIX: Logging creation events gives a full audit trail of when checks
+    # were created and by which project.
+    if created:
+        logger.info(
+            "Check created: code=%s name=%r project=%s",
+            check.code,
+            check.name,
+            request.project.code,
+        )
 
     return JsonResponse(check.to_dict(v=request.v), status=201 if created else 200)
 
@@ -459,7 +534,6 @@ def create_check(request: ApiRequest) -> HttpResponse:
 def checks(request: HttpRequest) -> HttpResponse:
     if request.method == "POST":
         return create_check(request)
-
     return get_checks(request)
 
 
@@ -476,6 +550,16 @@ def channels(request: ApiRequest) -> JsonResponse:
 def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
+        # [IMPROVEMENT 15] Log cross-project access attempts.
+        # ORIGINAL: returned 403 with no log.
+        # FIX: A project accessing another project's check may indicate a
+        # misconfigured or malicious client. This should be logged as a warning.
+        logger.warning(
+            "get_check forbidden: check=%s belongs to project=%s but request is from project=%s",
+            code,
+            check.project_id,
+            request.project.id,
+        )
         return HttpResponseForbidden()
 
     return JsonResponse(check.to_dict(readonly=request.readonly, v=request.v))
@@ -493,44 +577,69 @@ def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpRespons
 
 @authorize
 def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
-    # Don't acquire lock right away, first see if the check exists
-    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
+        logger.warning(
+            "update_check forbidden: check=%s project mismatch (request project=%s)",
+            code,
+            request.project.id,
+        )
         return HttpResponseForbidden()
 
     try:
         spec = Spec.model_validate(request.json, strict=True)
     except ValidationError as e:
-        return JsonResponse({"error": format_first_error(e)}, status=400)
+        error_msg = format_first_error(e)
+        logger.warning(
+            "update_check validation error: check=%s project=%s error=%r",
+            code,
+            request.project.code,
+            error_msg,
+        )
+        return JsonResponse({"error": error_msg}, status=400)
 
-    # Start a transaction, select for update, update.
-    # Use get_object_or_404 here again, in case another concurrent request
-    # has *just* deleted this check.
     with transaction.atomic():
         check = get_object_or_404(Check.objects.select_for_update(), code=code)
         try:
             _update(check, spec, request.v)
         except BadChannelException as e:
+            logger.warning(
+                "update_check bad channel: check=%s error=%r", code, e.message
+            )
             return JsonResponse({"error": e.message}, status=400)
+
+    # [IMPROVEMENT 16] Log successful updates.
+    # ORIGINAL: No logging on successful updates.
+    # FIX: Logging updates provides an audit trail of configuration changes.
+    logger.info(
+        "Check updated: code=%s project=%s", check.code, request.project.code
+    )
 
     return JsonResponse(check.to_dict(v=request.v))
 
 
 @authorize
 def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
-    # Don't acquire lock right away, first see if the check exists
-    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
+        logger.warning(
+            "delete_check forbidden: check=%s project mismatch (request project=%s)",
+            code,
+            request.project.id,
+        )
         return HttpResponseForbidden()
 
-    # Start a transaction, select for update, delete.
-    # Use get_object_or_404 here again, in case another concurrent request
-    # has *just* deleted this check.
     with transaction.atomic():
         check = get_object_or_404(Check.objects.select_for_update(), code=code)
         check.delete()
+
+    # [IMPROVEMENT 17] Log check deletion — a destructive, irreversible action.
+    # ORIGINAL: No logging on deletion.
+    # FIX: Deletions are high-value audit events. If a check disappears, the
+    # log tells you when and from which project it was deleted.
+    logger.info(
+        "Check deleted: code=%s name=%r project=%s", code, check.name, request.project.code
+    )
 
     return JsonResponse(check.to_dict(v=request.v))
 
@@ -540,10 +649,8 @@ def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
 def single(request: HttpRequest, code: UUID) -> HttpResponse:
     if request.method == "POST":
         return update_check(request, code)
-
     if request.method == "DELETE":
         return delete_check(request, code)
-
     return get_check(request, code)
 
 
@@ -555,21 +662,21 @@ def pause(request: ApiRequest, code: UUID) -> HttpResponse:
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    # Return early, without creating a flip object, if the check is already paused
     if check.status == "paused":
         return JsonResponse(check.to_dict(v=request.v))
 
-    # Track the status change for correct downtime calculation in Check.downtimes()
     check.create_flip("paused", mark_as_processed=True)
-
     check.status = "paused"
     check.last_start = None
     check.alert_after = None
     check.save()
-
-    # After pausing a check we must check if all checks are up,
-    # and Profile.next_nag_date needs to be cleared out:
     check.project.update_next_nag_dates()
+
+    # [IMPROVEMENT 18] Log pause action.
+    # ORIGINAL: No logging on pause.
+    # FIX: Pausing a check silences alerts. Logging this is important for
+    # post-incident reviews ("why did we not get alerted?").
+    logger.info("Check paused: code=%s project=%s", check.code, request.project.code)
 
     return JsonResponse(check.to_dict(v=request.v))
 
@@ -583,15 +690,25 @@ def resume(request: ApiRequest, code: UUID) -> HttpResponse:
         return HttpResponseForbidden()
 
     if check.status != "paused":
+        # [IMPROVEMENT 19] Log invalid resume attempts.
+        # ORIGINAL: returned 409 with no log.
+        # FIX: Attempting to resume a non-paused check may indicate a race
+        # condition or client bug. Logging it helps diagnose integration issues.
+        logger.warning(
+            "resume rejected: check=%s is not paused (status=%s)",
+            check.code,
+            check.status,
+        )
         return HttpResponse("check is not paused", status=409)
 
     check.create_flip("new", mark_as_processed=True)
-
     check.status = "new"
     check.last_start = None
     check.last_ping = None
     check.alert_after = None
     check.save()
+
+    logger.info("Check resumed: code=%s project=%s", check.code, request.project.code)
 
     return JsonResponse(check.to_dict(v=request.v))
 
@@ -604,20 +721,10 @@ def pings(request: ApiRequest, code: UUID) -> HttpResponse:
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    # Look up ping log limit from account's profile.
-    # There might be more pings in the database (depends on how pruning is handled)
-    # but we will not return more than the limit allows.
     profile = Profile.objects.get(user__project=request.project)
-    # Cap the number of returned pings to 1000.
     limit = min(profile.ping_log_limit, 1000)
-
-    # Query in descending order so we're sure to get the most recent
-    # pings, regardless of the limit restriction
     pings = list(Ping.objects.filter(owner=check).order_by("-id")[:limit])
     prepare_durations(pings)
-
-    # Pass check's code to Ping.to_dict(), so it does not need to look it up
-    # (which would result in a database query)
     ping_dicts = [p.to_dict(owner_code=check.code, v=request.v) for p in pings]
     return JsonResponse({"pings": ping_dicts})
 
@@ -639,6 +746,17 @@ def ping_body(request: ApiRequest, code: UUID, n: int) -> HttpResponse:
     try:
         body = ping.get_body_bytes()
     except Ping.GetBodyError:
+        # [IMPROVEMENT 20] Log object storage retrieval errors at ERROR level.
+        # ORIGINAL: returned 503 with no log.
+        # FIX: A GetBodyError means external object storage (S3/MinIO) is
+        # unavailable or the object is missing. This is an infrastructure problem
+        # that needs immediate operator attention. ERROR-level ensures alerting.
+        logger.error(
+            "ping_body: failed to retrieve body from object storage "
+            "for check=%s ping_n=%d",
+            check.code,
+            n,
+        )
         return HttpResponse(status=503)
 
     if not body:
@@ -654,16 +772,23 @@ def flips(request: ApiRequest, check: Check) -> HttpResponse:
 
     form = FlipsFiltersForm(request.GET)
     if not form.is_valid():
+        # [IMPROVEMENT 21] Log invalid flip filter parameters.
+        # ORIGINAL: returned 400 with no log.
+        # FIX: Bad flip filter parameters indicate a client integration bug.
+        # Logging the errors helps API consumers understand what they got wrong.
+        logger.warning(
+            "flips: invalid filter params for check=%s errors=%r",
+            check.code,
+            form.errors,
+        )
         return HttpResponseBadRequest()
 
     flips = Flip.objects.filter(owner=check).order_by("-id")
 
     if form.cleaned_data["start"]:
         flips = flips.filter(created__gte=form.cleaned_data["start"])
-
     if form.cleaned_data["end"]:
         flips = flips.filter(created__lt=form.cleaned_data["end"])
-
     if form.cleaned_data["seconds"]:
         threshold = now() - td(seconds=form.cleaned_data["seconds"])
         flips = flips.filter(created__gte=threshold)
@@ -739,6 +864,14 @@ def badge(
         with_late = False
 
     if not check_signature(badge_key, tag, signature):
+        # [IMPROVEMENT 22] Log invalid badge signature attempts.
+        # ORIGINAL: returned 404 with no log.
+        # FIX: An invalid signature may indicate a tampered or expired URL.
+        # Logging at DEBUG level (not WARNING, since this may be common for
+        # expired URLs) helps diagnose badge rendering issues.
+        logger.debug(
+            "badge: invalid signature for badge_key=%s tag=%r", badge_key, tag
+        )
         return HttpResponseNotFound()
 
     q = Check.objects.filter(project__badge_key=badge_key)
@@ -752,16 +885,12 @@ def badge(
     for check in q:
         if tag != "*" and tag not in check.tags_list():
             continue
-
         total += 1
         check_status = check.get_status()
-
         if check_status == "down":
             down += 1
             status = "down"
             if fmt == "svg":
-                # For SVG badges, we can leave the loop as soon as we
-                # find the first "down"
                 break
         elif check_status == "grace":
             grace += 1
@@ -822,23 +951,26 @@ def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
         cutoff = now() - td(hours=1)
         notification = Notification.objects.get(code=code, created__gt=cutoff)
     except Notification.DoesNotExist:
-        # If the notification does not exist, or is more than a hour old,
-        # return HTTP 200 so the other party doesn't retry over and over again:
+        # [IMPROVEMENT 23] Log expired/missing notification callbacks at DEBUG.
+        # ORIGINAL: returned HTTP 200 silently.
+        # FIX: Expired callbacks from delivery providers (Twilio, etc.) are
+        # normal but worth logging at DEBUG so operators can verify retry storms
+        # are not happening.
+        logger.debug(
+            "notification_status: notification %s not found or older than 1 hour", code
+        )
         return HttpResponse()
 
     error, mark_disabled = None, False
 
-    # Look for "error" and "mark_disabled" keys:
     if request.POST.get("error"):
         error = request.POST["error"][:200]
         mark_disabled = bool(request.POST.get("mark_disabled"))
 
-    # Handle "MessageStatus" key from Twilio
     if request.POST.get("MessageStatus") in ("failed", "undelivered"):
         status = request.POST["MessageStatus"]
         error = f"Delivery failed (status={status})."
 
-    # Handle "CallStatus" key from Twilio
     if request.POST.get("CallStatus") == "failed":
         error = "Delivery failed (status=failed)."
 
@@ -851,6 +983,18 @@ def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
         if mark_disabled:
             channel_q.update(disabled=True)
 
+        # [IMPROVEMENT 24] Log notification delivery failures.
+        # ORIGINAL: No logging of delivery failures.
+        # FIX: A delivery failure means a user did NOT receive an alert. This is
+        # a critical event — logging it at WARNING ensures operators and monitoring
+        # tools can detect patterns of failed notification channels.
+        logger.warning(
+            "Notification delivery failed: notification=%s error=%r mark_disabled=%s",
+            code,
+            error,
+            mark_disabled,
+        )
+
     return HttpResponse()
 
 
@@ -860,6 +1004,11 @@ def metrics(request: HttpRequest) -> HttpResponse:
 
     key = request.headers.get("X-Metrics-Key")
     if key != settings.METRICS_KEY:
+        # [IMPROVEMENT 25] Log invalid metrics key usage.
+        # ORIGINAL: returned 403 with no log.
+        # FIX: The metrics endpoint is sensitive. An invalid key may indicate a
+        # misconfigured scraper or a brute-force attempt.
+        logger.warning("metrics: invalid X-Metrics-Key from %s", request.META.get("REMOTE_ADDR"))
         return HttpResponseForbidden()
 
     doc = {
@@ -876,7 +1025,6 @@ def status(request: HttpRequest) -> HttpResponse:
     with connection.cursor() as c:
         c.execute("SELECT 1")
         c.fetchone()
-
     return HttpResponse("OK")
 
 
@@ -888,8 +1036,14 @@ def bounces(request: HttpRequest) -> HttpResponse:
     try:
         unsigned = unsign_bounce_id(to_local, max_age=3600 * 48)
     except BadSignature:
-        # If the signature is invalid or expired return HTTP 200 so the other party
-        # doesn't retry over and over again-
+        # [IMPROVEMENT 26] Log bad bounce signatures at DEBUG level.
+        # ORIGINAL: returned HTTP 200 silently.
+        # FIX: Bad signatures may occur for expired bounce addresses (normal)
+        # or for spoofed emails (abnormal). DEBUG-level logging lets operators
+        # investigate if needed without flooding WARNING logs.
+        logger.debug(
+            "bounces: bad or expired bounce signature for to_local=%r", to_local
+        )
         return HttpResponse("OK (bad signature)")
 
     status, diagnostic = "", ""
@@ -912,6 +1066,10 @@ def bounces(request: HttpRequest) -> HttpResponse:
             cutoff = now() - td(hours=48)
             n = Notification.objects.get(code=notification_code, created__gt=cutoff)
         except Notification.DoesNotExist:
+            logger.debug(
+                "bounces: notification %s not found for bounce processing",
+                notification_code,
+            )
             return HttpResponse("OK (notification not found)")
 
         if diagnostic:
@@ -928,12 +1086,25 @@ def bounces(request: HttpRequest) -> HttpResponse:
         if permanent:
             channel_q.update(disabled=True)
 
+        # [IMPROVEMENT 27] Log email bounce events.
+        # ORIGINAL: No logging on bounce processing.
+        # FIX: An email bounce means a user's notification email is bouncing.
+        # Logging it at WARNING ensures it surfaces in monitoring dashboards.
+        logger.warning(
+            "Email bounce processed: notification=%s status=%r permanent=%s error=%r",
+            notification_code,
+            status,
+            permanent,
+            error,
+        )
+
     if unsigned.startswith("r.") and permanent:
         username = unsigned[2:]
 
         try:
             profile = Profile.objects.get(user__username=username)
         except Profile.DoesNotExist:
+            logger.debug("bounces: profile not found for username=%r", username)
             return HttpResponse("OK (user not found)")
 
         profile.reports = "off"
@@ -941,5 +1112,13 @@ def bounces(request: HttpRequest) -> HttpResponse:
         profile.nag_period = td()
         profile.next_nag_date = None
         profile.save()
+
+        # [IMPROVEMENT 28] Log when a user's reports are disabled due to a bounce.
+        # ORIGINAL: No logging when a user's reports get turned off.
+        # FIX: This is a significant side-effect — the user will stop receiving
+        # monthly reports. Logging it at INFO ensures it is traceable.
+        logger.info(
+            "Reports disabled due to permanent email bounce: username=%r", username
+        )
 
     return HttpResponse("OK")
