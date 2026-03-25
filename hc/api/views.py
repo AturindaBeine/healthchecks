@@ -121,6 +121,8 @@ class Spec(BaseModel):
                 it = CronSim(v, datetime(2000, 1, 1))
                 next(it)
             except (CronSimError, StopIteration):
+                # it originally raised a PydanticCustomError without logging so we log a warning with the bad value so that the operators can see
+                logger.warning("Invalid cron expression submitted: %r", v)
                 raise PydanticCustomError("cron_syntax", "not a valid cron expression")
         else:
             try:
