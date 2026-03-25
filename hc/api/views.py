@@ -230,20 +230,14 @@ def ping(
     rid, rid_str = None, request.GET.get("rid")
     if rid_str is not None:
         if not is_valid_uuid_string(rid_str):
-            # [IMPROVEMENT 5] Log malformed rid parameters.
-            # ORIGINAL: returned 400 with no log.
-            # FIX: A malformed UUID in 'rid' suggests a client formatting bug.
-            # Logging the bad value speeds up debugging.
+            # A malformed UUID in 'rid' suggests a client formatting bug and logging the bad value speeds up debugging.
             logger.warning(
                 "Malformed rid parameter %r for check %s", rid_str, check.code
             )
             return HttpResponseBadRequest("invalid uuid format")
         rid = UUID(rid_str)
 
-    # [IMPROVEMENT 6] Log the ping action at DEBUG level.
-    # ORIGINAL: No logging of ping actions whatsoever.
-    # FIX: Logging each ping with its check code, action, and source IP gives
-    # operators an audit trail and helps diagnose why a check changed state.
+    # logging each ping with its check code, action, and source IP to give operators an audit trail and helps diagnose why a check changed state.
     logger.debug(
         "Ping received: check=%s action=%s remote_addr=%s method=%s",
         check.code,
@@ -270,10 +264,7 @@ def ping_by_slug(
     exitstatus: int | None = None,
 ) -> HttpResponse:
     if slug != slug.lower():
-        # [IMPROVEMENT 7] Log uppercase slug attempts.
-        # ORIGINAL: returned 400 silently.
-        # FIX: Uppercase slugs are a common misconfiguration. Logging the slug
-        # and ping_key helps identify which project/check is misconfigured.
+        # logging the slug and ping_key helps identify which project/check is misconfigured.
         logger.warning(
             "Ping rejected: slug %r is not lowercase (ping_key=%s)", slug, ping_key
         )
@@ -294,15 +285,12 @@ def ping_by_slug(
         try:
             project = Project.objects.get(ping_key=ping_key)
         except Project.DoesNotExist:
-            # [IMPROVEMENT 8] Log missing project on auto-create path.
-            # ORIGINAL: returned 404 with no context about why creation failed.
-            # FIX: This tells operators that auto-create was attempted with an
-            # invalid ping_key, which may indicate a misconfigured integration.
             logger.warning(
                 "Auto-create failed: no project with ping_key=%s slug=%r",
                 ping_key,
                 slug,
-            )
+            ) 
+            # tells operators that auto-create was attempted with an invalid ping_key, which may indicate a misconfigured integration.
             return HttpResponseNotFound("not found")
 
         check = Check(project=project, name=slug, slug=slug)
@@ -310,19 +298,13 @@ def ping_by_slug(
         check.assign_all_channels()
         created = True
 
-        # [IMPROVEMENT 9] Log auto-created checks.
-        # ORIGINAL: No log on auto-creation.
-        # FIX: Auto-creating a check is a significant event — it changes the
-        # system state. Logging it provides an audit trail.
+        # log auto-created checks.
         logger.info(
             "Auto-created check: slug=%r project=%s", slug, project.code
         )
 
     except Check.MultipleObjectsReturned:
-        # [IMPROVEMENT 10] Log ambiguous slug collisions.
-        # ORIGINAL: returned 409 with no log.
-        # FIX: Multiple checks sharing a slug is a data integrity issue that
-        # admins need to investigate. An ERROR log ensures it is not missed.
+        # an error log for multiple checks sharing a slug.
         logger.error(
             "Ambiguous slug collision: slug=%r ping_key=%s", slug, ping_key
         )
@@ -453,10 +435,7 @@ def get_checks(request: ApiRequest) -> JsonResponse:
         if not tags or check.matches_tag_set(tags):
             checks.append(check.to_dict(readonly=request.readonly, v=request.v))
 
-    # [IMPROVEMENT 11] Log API list requests at DEBUG level.
-    # ORIGINAL: No logging on GET /api/v1/checks.
-    # FIX: Logging the project and number of returned checks helps trace
-    # unexpected empty responses or large payload issues in production.
+    # logging the project and number of returned checks to trace unexpected empty responses or large payload issues in production.
     logger.debug(
         "get_checks: project=%s returned %d checks (tags=%r, slug=%r)",
         request.project.code,
@@ -474,11 +453,7 @@ def create_check(request: ApiRequest) -> HttpResponse:
         spec = Spec.model_validate(request.json, strict=True)
     except ValidationError as e:
         error_msg = format_first_error(e)
-        # [IMPROVEMENT 12] Log validation errors with project context.
-        # ORIGINAL: returned 400 with no log.
-        # FIX: Validation errors can reveal integration bugs on the client side.
-        # Logging them with the project helps operators identify which API
-        # consumers are sending malformed requests.
+        # log validation errors to reveal integration bugs on the client side and to help operators identify which API consumers are sending malformed requests.
         logger.warning(
             "create_check validation error: project=%s error=%r",
             request.project.code,
@@ -490,11 +465,7 @@ def create_check(request: ApiRequest) -> HttpResponse:
     check = _lookup(request.project, spec)
     if check is None:
         if request.project.num_checks_available() <= 0:
-            # [IMPROVEMENT 13] Log check limit reached.
-            # ORIGINAL: returned 403 silently.
-            # FIX: Hitting the check limit is a business-critical event. Logging
-            # it with the project code lets operators proactively notify users or
-            # upgrade plan limits.
+            # log when the check limit has been reached.
             logger.warning(
                 "create_check rejected: project=%s has reached check limit",
                 request.project.code,
@@ -514,10 +485,7 @@ def create_check(request: ApiRequest) -> HttpResponse:
         )
         return JsonResponse({"error": e.message}, status=400)
 
-    # [IMPROVEMENT 14] Log successful check creation.
-    # ORIGINAL: No logging on successful creation.
-    # FIX: Logging creation events gives a full audit trail of when checks
-    # were created and by which project.
+    # log creation of a check successfully
     if created:
         logger.info(
             "Check created: code=%s name=%r project=%s",
