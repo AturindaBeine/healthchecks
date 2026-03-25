@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import email.policy
+import logging
 import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
 from hc.lib.tz import all_timezones, legacy_timezones
 
+logger = logging.getLogger(__name__)  # added logger
 
 class BadChannelException(Exception):
     def __init__(self, message: str):
@@ -83,8 +85,8 @@ class Spec(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_nulls(cls, data: dict[str, Any]) -> dict[str, Any]:
-        # Look for any null values in the incoming data. Replace them with a
-        # float. None of the fields have a float type, and we are using
+        # Look for any null values in the incoming data. Replace them with a float.
+        # None of the fields have a float type, and we are using
         # strict validation, so this will cause type validation to fail.
         for k, v in data.items():
             if v is None:
