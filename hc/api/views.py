@@ -298,13 +298,13 @@ def ping_by_slug(
         check.assign_all_channels()
         created = True
 
-        # log auto-created checks.
+        # log auto-created checks
         logger.info(
             "Auto-created check: slug=%r project=%s", slug, project.code
         )
 
     except Check.MultipleObjectsReturned:
-        # an error log for multiple checks sharing a slug.
+        # an error log for multiple checks sharing a slug
         logger.error(
             "Ambiguous slug collision: slug=%r ping_key=%s", slug, ping_key
         )
@@ -888,7 +888,7 @@ def check_badge(
 @csrf_exempt
 @require_POST
 def notification_status(request: HttpRequest, code: UUID) -> HttpResponse:
-    """Handle notification delivery status callbacks."""
+    # Handle notification delivery status callbacks
 
     try:
         cutoff = now() - td(hours=1)
